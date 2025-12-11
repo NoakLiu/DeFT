@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
+from .deft.builder import build_deft_module
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
@@ -34,6 +35,9 @@ class LlavaMetaModel:
         if hasattr(config, "mm_vision_tower"):
             self.vision_tower = build_vision_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
+            
+            # Initialize DeFT module if enabled
+            self.deft_module = build_deft_module(config, token_dim=config.mm_hidden_size)
 
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
                 self.image_newline = nn.Parameter(
@@ -89,6 +93,10 @@ class LlavaMetaModel:
             # In case it is frozen by LoRA
             for p in self.mm_projector.parameters():
                 p.requires_grad = True
+        
+        # Initialize DeFT module if enabled
+        if getattr(self.config, 'use_deft', False) and getattr(self, 'deft_module', None) is None:
+            self.deft_module = build_deft_module(self.config, token_dim=self.config.mm_hidden_size)
 
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
@@ -137,9 +145,49 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):
+    def encode_images(self, images, task_loss=None, logits=None, apply_deft=True):
+        """
+        Encode images with optional DeFT tokenization.
+        
+        Args:
+            images: Input images
+            task_loss: Optional task loss for DeFT feedback scoring
+            logits: Optional logits for DeFT RTD reconstruction
+            apply_deft: Whether to apply DeFT tokenization
+        
+        Returns:
+            image_features: Encoded image features (potentially compressed by DeFT)
+        """
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
+        
+        # Apply DeFT tokenization if enabled
+        deft_module = getattr(self.get_model(), 'deft_module', None)
+        if deft_module is not None and apply_deft:
+            # Determine spatial shape for images
+            batch_size, num_tokens, token_dim = image_features.shape
+            # Assume square patches for now (can be improved with actual spatial info)
+            h = w = int(num_tokens ** 0.5) if num_tokens > 0 else 1
+            
+            # Apply DeFT
+            deft_output = deft_module(
+                tokens=image_features,
+                modality='image',
+                spatial_shape=(h, w) if h * w == num_tokens else None,
+                task_loss=task_loss,
+                logits=logits,
+                inference_mode='fast' if not self.training else 'hybrid'
+            )
+            
+            # Use retained tokens (and optionally reconstructed ones)
+            image_features = deft_output['retained_tokens']
+            
+            # If hybrid path and reconstructed tokens available, concatenate them
+            if deft_output['reconstructed_tokens'] is not None:
+                # In hybrid mode, we could concatenate, but for now use only retained
+                # This can be customized based on inference strategy
+                pass
+        
         return image_features
 
     def prepare_inputs_labels_for_multimodal(
